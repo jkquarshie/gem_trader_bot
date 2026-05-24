@@ -10,6 +10,7 @@ import requests
 import json
 from datetime import datetime
 import struct
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +33,11 @@ class RugChecker:
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
     }
     
-    def __init__(self, rpc_endpoint: str):
+    def __init__(self, rpc_endpoint: str, rate_limit_delay: float = 0.3):
         self.rpc_endpoint = rpc_endpoint
         self.session = requests.Session()
+        self._last_rpc_time = 0.0
+        self._rate_limit_delay = rate_limit_delay
     
     def check_token(self, token_mint: str) -> Dict:
         """
@@ -85,9 +88,15 @@ class RugChecker:
     
     def _rpc_call(self, method: str, params: List) -> Optional[Dict]:
         """
-        Make a JSON-RPC call to Solana via Helius.
+        Make a JSON-RPC call to Solana via Helius with rate limiting.
         """
         try:
+            # Rate limiting: ensure minimum delay between calls
+            now = time.time()
+            elapsed = now - self._last_rpc_time
+            if elapsed < self._rate_limit_delay:
+                time.sleep(self._rate_limit_delay - elapsed)
+            
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -95,7 +104,17 @@ class RugChecker:
                 "params": params
             }
             response = self.session.post(self.rpc_endpoint, json=payload, timeout=10)
+            
+            # Handle 429 Too Many Requests
+            if response.status_code == 429:
+                retry_after = 2.0
+                logger.warning(f"Rate limited (429). Waiting {retry_after}s...")
+                time.sleep(retry_after)
+                response = self.session.post(self.rpc_endpoint, json=payload, timeout=10)
+            
             response.raise_for_status()
+            
+            self._last_rpc_time = time.time()
             
             result = response.json()
             if 'error' in result:

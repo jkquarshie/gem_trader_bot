@@ -195,7 +195,47 @@ class ChartAnalyzer:
             logger.error(f"Error analyzing volume: {e}")
             return "UNKNOWN"
     
-    def analyze_token_chart(self, token_mint: str) -> Dict:
+    def detect_volume_spike(self, volume_5m: float, volume_1h: float) -> Dict:
+        """
+        Detect if volume is spiking compared to recent average.
+        
+        Args:
+            volume_5m: Volume in last 5 minutes
+            volume_1h: Volume in last 1 hour
+        
+        Returns:
+            Dict with: is_spiking, spike_ratio, signal
+        """
+        if volume_5m <= 0 or volume_1h <= 0:
+            return {'is_spiking': False, 'spike_ratio': 1.0, 'signal': 'NO_DATA'}
+        
+        # Extrapolate 5m volume to 1h (multiply by 12)
+        extrapolated_1h = volume_5m * 12
+        
+        # Compare extrapolated to actual 1h volume
+        if extrapolated_1h > 0 and volume_1h > 0:
+            spike_ratio = extrapolated_1h / volume_1h
+        else:
+            spike_ratio = 1.0
+        
+        is_spiking = spike_ratio > 1.5  # 50%+ increase = spike
+        
+        if spike_ratio > 3.0:
+            signal = "STRONG_SPIKE"
+        elif spike_ratio > 1.5:
+            signal = "SPIKE"
+        else:
+            signal = "NORMAL"
+        
+        logger.info(f"Volume spike: ratio={spike_ratio:.1f}x, signal={signal}")
+        
+        return {
+            'is_spiking': is_spiking,
+            'spike_ratio': spike_ratio,
+            'signal': signal,
+        }
+    
+    def analyze_token_chart(self, token_mint: str, token_data: Dict = None) -> Dict:
         """
         Perform comprehensive chart analysis on a token.
         
@@ -219,6 +259,8 @@ class ChartAnalyzer:
                     'resistance': 0,
                     'ma_50': 0,
                     'volume_trend': 'UNKNOWN',
+                    'volume_spike': 'NO_DATA',
+                    'spike_ratio': 1.0,
                     'signal': 'INSUFFICIENT_DATA',
                     'score': 0,
                 }
@@ -233,11 +275,18 @@ class ChartAnalyzer:
             ma_50 = self.calculate_moving_average(prices, period=50)
             volume_trend = self.analyze_volume_trend(volumes, period=10)
             
+            # Volume spike detection from DexScreener data
+            vol_spike = {}
+            if token_data:
+                vol_5m = float(token_data.get('volume_5m_usd', 0))
+                vol_1h = float(token_data.get('volume_1h_usd', 0))
+                vol_spike = self.detect_volume_spike(vol_5m, vol_1h)
+            
             # Generate signal
-            signal = self._generate_signal(rsi, prices[-1], support, resistance, ma_50, volume_trend)
+            signal = self._generate_signal(rsi, prices[-1], support, resistance, ma_50, volume_trend, vol_spike.get('signal'))
             
             # Calculate confidence score (0-100)
-            score = self._calculate_score(rsi, prices[-1], support, resistance, volume_trend)
+            score = self._calculate_score(rsi, prices[-1], support, resistance, volume_trend, vol_spike.get('signal'))
             
             result = {
                 'rsi': rsi,
@@ -246,6 +295,8 @@ class ChartAnalyzer:
                 'current_price': prices[-1],
                 'ma_50': ma_50,
                 'volume_trend': volume_trend,
+                'volume_spike': vol_spike.get('signal', 'NO_DATA'),
+                'spike_ratio': vol_spike.get('spike_ratio', 1.0),
                 'signal': signal,
                 'score': score,
                 'analyzed_at': datetime.now().isoformat(),
@@ -262,6 +313,8 @@ class ChartAnalyzer:
                 'resistance': 0,
                 'ma_50': 0,
                 'volume_trend': 'UNKNOWN',
+                'volume_spike': 'NO_DATA',
+                'spike_ratio': 1.0,
                 'signal': 'ERROR',
                 'score': 0,
             }
@@ -295,7 +348,7 @@ class ChartAnalyzer:
             logger.error(f"Error fetching token info: {e}")
             return None
     
-    def _generate_signal(self, rsi: float, price: float, support: float, resistance: float, ma: float, vol_trend: str) -> str:
+    def _generate_signal(self, rsi: float, price: float, support: float, resistance: float, ma: float, vol_trend: str, vol_spike: str = None) -> str:
         """Generate buy/sell/hold signal based on indicators."""
         signals = []
         
@@ -323,23 +376,37 @@ class ChartAnalyzer:
         elif vol_trend == "DECREASING":
             signals.append("VOLUME_DOWN")
         
+        # Volume spike signal
+        if vol_spike == "STRONG_SPIKE":
+            signals.append("VOLUME_SPIKE_STRONG")
+        elif vol_spike == "SPIKE":
+            signals.append("VOLUME_SPIKE")
+        
         # Aggregate signals
-        if "OVERSOLD" in signals and "VOLUME_UP" in signals:
+        if "OVERSOLD" in signals and "VOLUME_SPIKE" in signals:
             return "STRONG_BUY"
-        elif "OVERSOLD" in signals:
-            return "BUY"
+        elif "OVERSOLD" in signals and "VOLUME_UP" in signals:
+            return "STRONG_BUY"
+        elif "OVERBOUGHT" in signals and "VOLUME_SPIKE" in signals:
+            return "STRONG_SELL"
         elif "OVERBOUGHT" in signals and "VOLUME_DOWN" in signals:
             return "STRONG_SELL"
+        elif "OVERSOLD" in signals:
+            return "BUY"
         elif "OVERBOUGHT" in signals:
             return "SELL"
+        elif "NEAR_SUPPORT" in signals and "VOLUME_SPIKE" in signals:
+            return "BUY"
         elif "NEAR_SUPPORT" in signals and "VOLUME_UP" in signals:
             return "BUY"
+        elif "NEAR_RESISTANCE" in signals and "VOLUME_SPIKE" in signals:
+            return "SELL"
         elif "NEAR_RESISTANCE" in signals and "VOLUME_DOWN" in signals:
             return "SELL"
         else:
             return "HOLD"
     
-    def _calculate_score(self, rsi: float, price: float, support: float, resistance: float, vol_trend: str) -> int:
+    def _calculate_score(self, rsi: float, price: float, support: float, resistance: float, vol_trend: str, vol_spike: str = None) -> int:
         """Calculate 0-100 confidence score for trade."""
         score = 50  # Start at neutral
         
@@ -357,9 +424,15 @@ class ChartAnalyzer:
         
         # Volume contribution
         if vol_trend == "INCREASING":
-            score += 10  # Increasing volume = bullish
+            score += 10
         elif vol_trend == "DECREASING":
-            score -= 5  # Decreasing volume = mild bearish
+            score -= 5
+        
+        # Volume spike contribution
+        if vol_spike == "STRONG_SPIKE":
+            score += 20
+        elif vol_spike == "SPIKE":
+            score += 10
         
         return max(0, min(100, score))
 

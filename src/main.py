@@ -9,7 +9,7 @@ import asyncio
 import os
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -41,7 +41,12 @@ class GemTraderBot:
         
         # Trading params
         self.min_liquidity = float(os.getenv('MIN_LIQUIDITY_USD', 5000))
+        self.min_market_cap = float(os.getenv('MIN_MARKET_CAP_USD', 50000))
+        self.min_age_minutes = int(os.getenv('MIN_AGE_MINUTES', 5))
         self.max_age = int(os.getenv('MAX_AGE_MINUTES', 60))
+        self.max_holder_pct = float(os.getenv('MAX_HOLDER_CONCENTRATION', 0.30))
+        self.min_volume_5m = float(os.getenv('MIN_VOLUME_5M_USD', 1000))
+        self.volume_spike_min_ratio = float(os.getenv('VOLUME_SPIKE_MIN_RATIO', 1.5))
         self.profit_target = float(os.getenv('PROFIT_TARGET_PERCENT', 100))
         self.stop_loss = float(os.getenv('STOP_LOSS_PERCENT', 10))
         self.risk_per_trade = float(os.getenv('RISK_PERCENT', 5))
@@ -166,6 +171,24 @@ class GemTraderBot:
             
             logger.info(f"Analyzing {token['symbol']} ({mint[:8]}...)")
             
+            # Filter: market cap
+            market_cap = token.get('market_cap_usd', 0)
+            if self.min_market_cap > 0 and market_cap > 0 and market_cap < self.min_market_cap:
+                logger.info(f"  Market cap filter: SKIPPED (${market_cap} < ${self.min_market_cap})")
+                continue
+            
+            # Filter: token age
+            created_at = token.get('pair_created_at')
+            if created_at and self.min_age_minutes > 0:
+                try:
+                    created_ts = created_at / 1000 if created_at > 1e10 else created_at
+                    age_minutes = (datetime.now().timestamp() - created_ts) / 60
+                    if age_minutes < self.min_age_minutes:
+                        logger.info(f"  Age filter: SKIPPED ({age_minutes:.0f} min, need {self.min_age_minutes})")
+                        continue
+                except Exception:
+                    pass
+            
             # Stage 2: Rug check
             rug_result = self.rug_checker.check_token(mint)
             
@@ -173,8 +196,20 @@ class GemTraderBot:
                 logger.info(f"  Scam filter: SKIPPED ({rug_result['risk_score']}/100)")
                 continue
             
-            # Stage 3: Chart analysis
-            chart_result = self.chart_analyzer.analyze_token_chart(mint)
+            # Filter: holder concentration
+            holder_pct = rug_result['checks'].get('holder_concentration', 0)
+            if holder_pct > self.max_holder_pct:
+                logger.info(f"  Holder concentration filter: SKIPPED ({holder_pct:.0%} > {self.max_holder_pct:.0%})")
+                continue
+            
+            # Filter: volume spike (optional)
+            vol_5m = float(token.get('volume_5m_usd', 0))
+            if self.min_volume_5m > 0 and vol_5m > 0 and vol_5m < self.min_volume_5m:
+                logger.info(f"  Volume filter: SKIPPED (5m vol ${vol_5m:.0f} < ${self.min_volume_5m})")
+                continue
+            
+            # Stage 3: Chart analysis (with volume data)
+            chart_result = self.chart_analyzer.analyze_token_chart(mint, token_data=token)
             
             if chart_result['signal'] not in ['BUY', 'STRONG_BUY']:
                 logger.info(f"  Chart filter: SKIPPED ({chart_result['signal']})")
@@ -198,7 +233,6 @@ class GemTraderBot:
                 trade_id = await self.bot.send_alert(plan)
                 if trade_id:
                     logger.info(f"  Alert sent! Trade ID: {trade_id}")
-                    # Wait a bit for user to respond
                     await asyncio.sleep(5)
             else:
                 logger.info(f"  Trade ready (no Telegram configured): {token['symbol']}")
