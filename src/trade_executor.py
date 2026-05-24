@@ -1,0 +1,481 @@
+"""
+Trade execution module for Solana token swaps.
+Uses Jupiter API for best price routing and execution.
+Manages wallet balances and position sizing.
+"""
+
+import logging
+import requests
+from typing import Dict, Optional, List, Tuple
+from datetime import datetime
+import json
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class TradeExecutor:
+    """
+    Executes trades on Solana via Jupiter API.
+    Handles swap routing, slippage protection, and position management.
+    """
+    
+    # Jupiter API endpoints
+    JUPITER_API = "https://api.jup.ag/swap/info"
+    JUPITER_PRICE_API = "https://price.jup.ag/v4"
+    JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
+    JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
+    
+    # Solana constants
+    SOL_DECIMALS = 9
+    USDC_MINT = "EPjFWaLb3hyccuBY4fgkQK9fu2TWrKSLBqqsCNCvuGjP"
+    WRAPPED_SOL = "So11111111111111111111111111111111111111112"
+    
+    def __init__(self, rpc_endpoint: str, wallet_address: str = None):
+        """
+        Initialize trade executor.
+        
+        Args:
+            rpc_endpoint: Solana RPC endpoint
+            wallet_address: User's wallet address (optional, for read-only mode)
+        """
+        self.rpc_endpoint = rpc_endpoint
+        self.wallet_address = wallet_address
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': 'GemTraderBot/1.0'})
+        
+        # Track positions
+        self.positions = {}  # mint -> {amount, entry_price, entry_time}
+    
+    def get_swap_quote(self, input_mint: str, output_mint: str, amount_in: int, slippage_bps: int = 50) -> Optional[Dict]:
+        """
+        Get swap quote from Jupiter.
+        
+        Args:
+            input_mint: Input token mint address
+            output_mint: Output token mint address
+            amount_in: Amount to swap (in smallest units)
+            slippage_bps: Slippage in basis points (50 = 0.5%)
+        
+        Returns:
+            Quote dict with: input_amount, output_amount, route_plan, etc.
+        """
+        logger.info(f"Getting quote: {amount_in} of {input_mint[:8]}... -> {output_mint[:8]}...")
+        
+        try:
+            params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": amount_in,
+                "slippageBps": slippage_bps,
+            }
+            
+            response = self.session.get(self.JUPITER_QUOTE_API, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'data' not in data or not data['data']:
+                logger.warning("No quote data received")
+                return None
+            
+            quote = data['data'][0] if isinstance(data['data'], list) else data['data']
+            
+            # Extract key info
+            input_amount = int(quote.get('inAmount', 0))
+            output_amount = int(quote.get('outAmount', 0))
+            price_impact = float(quote.get('priceImpactPct', 0))
+            
+            logger.info(f"Quote: {output_amount} output tokens (impact: {price_impact:.2f}%)")
+            
+            return {
+                'input_mint': input_mint,
+                'output_mint': output_mint,
+                'input_amount': input_amount,
+                'output_amount': output_amount,
+                'price_impact_pct': price_impact,
+                'slippage_bps': slippage_bps,
+                'route': quote.get('routePlan', []),
+                'quoted_at': datetime.now().isoformat(),
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting quote: {e}")
+            return None
+    
+    def get_token_prices(self, mint_addresses: List[str]) -> Dict[str, float]:
+        """
+        Get current prices for tokens.
+        
+        Args:
+            mint_addresses: List of token mint addresses
+        
+        Returns:
+            Dict mapping mint -> price in USD
+        """
+        logger.info(f"Fetching prices for {len(mint_addresses)} tokens")
+        
+        prices = {}
+        
+        try:
+            # Batch price queries
+            for mint in mint_addresses:
+                try:
+                    params = {"ids": mint}
+                    response = self.session.get(self.JUPITER_PRICE_API, params=params, timeout=5)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if 'data' in data and mint in data['data']:
+                        price = float(data['data'][mint].get('price', 0))
+                        prices[mint] = price
+                        logger.debug(f"  {mint[:8]}...: ${price:.8f}")
+                    
+                except Exception as e:
+                    logger.debug(f"Error fetching price for {mint}: {e}")
+                    prices[mint] = 0
+            
+            return prices
+            
+        except Exception as e:
+            logger.error(f"Error fetching token prices: {e}")
+            return {}
+    
+    def estimate_buy_amount(self, wallet_balance_sol: float, risk_percentage: float = 5.0) -> Tuple[int, float]:
+        """
+        Calculate buy amount based on wallet balance and risk tolerance.
+        
+        Args:
+            wallet_balance_sol: Wallet balance in SOL
+            risk_percentage: Percentage of wallet to risk per trade (5 = 5%)
+        
+        Returns:
+            Tuple of (amount_in_lamports, risk_usd)
+        """
+        try:
+            # Risk amount in SOL
+            risk_sol = wallet_balance_sol * (risk_percentage / 100)
+            
+            # Convert to lamports
+            risk_lamports = int(risk_sol * (10 ** self.SOL_DECIMALS))
+            
+            logger.info(f"Buy sizing: {risk_sol:.4f} SOL ({risk_percentage}% of wallet)")
+            
+            # Assume ~$150 per SOL for USD estimate
+            risk_usd = risk_sol * 150
+            
+            return (risk_lamports, risk_usd)
+            
+        except Exception as e:
+            logger.error(f"Error calculating buy amount: {e}")
+            return (0, 0)
+    
+    def validate_swap_safety(self, quote: Dict, max_price_impact: float = 10.0, max_slippage_bps: int = 200) -> Tuple[bool, str]:
+        """
+        Validate that a swap is safe to execute.
+        
+        Args:
+            quote: Quote data from get_swap_quote
+            max_price_impact: Maximum acceptable price impact (%)
+            max_slippage_bps: Maximum acceptable slippage (basis points)
+        
+        Returns:
+            Tuple of (is_safe, reason)
+        """
+        logger.info("Validating swap safety...")
+        
+        try:
+            price_impact = quote.get('price_impact_pct', 0)
+            slippage = quote.get('slippage_bps', 0)
+            
+            # Check price impact
+            if abs(price_impact) > max_price_impact:
+                return (False, f"Price impact too high: {price_impact:.2f}%")
+            
+            # Check slippage
+            if slippage > max_slippage_bps:
+                return (False, f"Slippage too high: {slippage} bps")
+            
+            # Check output amount
+            if quote.get('output_amount', 0) == 0:
+                return (False, "Zero output amount")
+            
+            logger.info("[OK] Swap is safe to execute")
+            return (True, "")
+            
+        except Exception as e:
+            logger.error(f"Error validating swap: {e}")
+            return (False, f"Validation error: {e}")
+    
+    def test_honeypot(self, token_mint: str, test_amount_lamports: int = 1000000) -> Tuple[bool, str]:
+        """
+        Test if token is a honeypot by simulating a small swap.
+        
+        Args:
+            token_mint: Token to test
+            test_amount_lamports: Small test amount in SOL (default: 0.001 SOL)
+        
+        Returns:
+            Tuple of (is_tradable, reason)
+        """
+        logger.info(f"Testing honeypot for {token_mint}")
+        
+        try:
+            # Get quote: SOL -> token
+            quote_buy = self.get_swap_quote(
+                self.WRAPPED_SOL,
+                token_mint,
+                test_amount_lamports,
+                slippage_bps=100
+            )
+            
+            if not quote_buy or quote_buy.get('output_amount', 0) == 0:
+                return (False, "Cannot buy token (no liquidity or sandwiched)")
+            
+            # Get quote: token -> SOL (simulate sell)
+            quote_sell = self.get_swap_quote(
+                token_mint,
+                self.WRAPPED_SOL,
+                quote_buy['output_amount'],
+                slippage_bps=100
+            )
+            
+            if not quote_sell or quote_sell.get('output_amount', 0) == 0:
+                return (False, "Cannot sell token (honeypot detected)")
+            
+            # Check if we can recover at least 50% of input
+            recovery_ratio = quote_sell['output_amount'] / test_amount_lamports
+            if recovery_ratio < 0.5:
+                return (False, f"High sell tax detected (only {recovery_ratio*100:.1f}% recoverable)")
+            
+            logger.info(f"[OK] Token appears tradable (recovery: {recovery_ratio*100:.1f}%)")
+            return (True, "")
+            
+        except Exception as e:
+            logger.error(f"Error testing honeypot: {e}")
+            return (False, f"Test failed: {e}")
+    
+    def record_position(self, token_mint: str, amount: int, entry_price: float):
+        """Record a bought position."""
+        self.positions[token_mint] = {
+            'amount': amount,
+            'entry_price': entry_price,
+            'entry_time': datetime.now().isoformat(),
+        }
+        logger.info(f"Position recorded: {amount} tokens at ${entry_price:.8f}")
+    
+    def calculate_pnl(self, token_mint: str, current_price: float) -> Optional[Dict]:
+        """
+        Calculate P&L for an open position.
+        
+        Args:
+            token_mint: Token mint address
+            current_price: Current token price in USD
+        
+        Returns:
+            Dict with: entry_price, current_price, amount, unrealized_pnl_pct, unrealized_pnl_usd
+        """
+        if token_mint not in self.positions:
+            logger.warning(f"No position found for {token_mint}")
+            return None
+        
+        try:
+            pos = self.positions[token_mint]
+            entry_price = pos['entry_price']
+            amount = pos['amount']
+            
+            # Calculate P&L
+            pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            pnl_usd = (current_price - entry_price) * amount
+            
+            result = {
+                'token_mint': token_mint,
+                'entry_price': entry_price,
+                'current_price': current_price,
+                'amount': amount,
+                'unrealized_pnl_pct': pnl_pct,
+                'unrealized_pnl_usd': pnl_usd,
+                'entry_time': pos['entry_time'],
+            }
+            
+            logger.info(f"P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error calculating P&L: {e}")
+            return None
+    
+    def check_exit_condition(self, token_mint: str, current_price: float, 
+                            take_profit_pct: float = 50.0, stop_loss_pct: float = 20.0) -> Optional[str]:
+        """
+        Check if position should be exited based on P&L targets.
+        
+        Args:
+            token_mint: Token mint address
+            current_price: Current price
+            take_profit_pct: Take profit target (%)
+            stop_loss_pct: Stop loss limit (%)
+        
+        Returns:
+            "TAKE_PROFIT", "STOP_LOSS", or None
+        """
+        pnl = self.calculate_pnl(token_mint, current_price)
+        if not pnl:
+            return None
+        
+        unrealized_pnl = pnl['unrealized_pnl_pct']
+        
+        if unrealized_pnl >= take_profit_pct:
+            logger.warning(f"Take profit hit: {unrealized_pnl:.2f}% >= {take_profit_pct}%")
+            return "TAKE_PROFIT"
+        
+        if unrealized_pnl <= -stop_loss_pct:
+            logger.warning(f"Stop loss hit: {unrealized_pnl:.2f}% <= -{stop_loss_pct}%")
+            return "STOP_LOSS"
+        
+        return None
+    
+    def get_execution_plan(self, token_info: Dict, rug_result: Dict, chart_result: Dict, 
+                          wallet_balance_sol: float, risk_pct: float = 5.0) -> Optional[Dict]:
+        """
+        Generate full trade execution plan.
+        
+        Args:
+            token_info: Token data from scanner
+            rug_result: Rug check results
+            chart_result: Chart analysis results
+            wallet_balance_sol: Wallet balance in SOL
+            risk_pct: Risk percentage per trade
+        
+        Returns:
+            Execution plan dict or None if trade should be skipped
+        """
+        logger.info(f"Generating execution plan for {token_info['symbol']}")
+        
+        try:
+            token_mint = token_info['mint']
+            
+            # Filter 1: Risk check
+            if rug_result['risk_score'] > 60:
+                return {
+                    'token': token_info['symbol'],
+                    'decision': 'SKIP',
+                    'reason': f"High rug risk: {rug_result['risk_score']}/100",
+                }
+            
+            # Filter 2: Chart signal
+            if chart_result['signal'] not in ['BUY', 'STRONG_BUY']:
+                return {
+                    'token': token_info['symbol'],
+                    'decision': 'SKIP',
+                    'reason': f"Unfavorable chart signal: {chart_result['signal']}",
+                }
+            
+            # Filter 3: Honeypot check
+            is_tradable, honeypot_msg = self.test_honeypot(token_mint)
+            if not is_tradable:
+                return {
+                    'token': token_info['symbol'],
+                    'decision': 'SKIP',
+                    'reason': f"Honeypot detected: {honeypot_msg}",
+                }
+            
+            # All checks passed - generate buy plan
+            amount_lamports, risk_usd = self.estimate_buy_amount(wallet_balance_sol, risk_pct)
+            
+            # Get swap quote
+            quote = self.get_swap_quote(
+                self.WRAPPED_SOL,
+                token_mint,
+                amount_lamports,
+                slippage_bps=100
+            )
+            
+            if not quote:
+                return {
+                    'token': token_info['symbol'],
+                    'decision': 'SKIP',
+                    'reason': "Could not get swap quote",
+                }
+            
+            # Validate swap
+            is_safe, safety_msg = self.validate_swap_safety(quote)
+            if not is_safe:
+                return {
+                    'token': token_info['symbol'],
+                    'decision': 'SKIP',
+                    'reason': f"Swap not safe: {safety_msg}",
+                }
+            
+            # All checks passed - ready to execute
+            plan = {
+                'token': token_info['symbol'],
+                'decision': 'EXECUTE',
+                'token_mint': token_mint,
+                'token_price': token_info['price_usd'],
+                'buy_amount_sol': amount_lamports / (10 ** self.SOL_DECIMALS),
+                'buy_amount_lamports': amount_lamports,
+                'risk_usd': risk_usd,
+                'output_tokens': quote['output_amount'],
+                'output_price': token_info['price_usd'],
+                'price_impact_pct': quote['price_impact_pct'],
+                'entry_price': token_info['price_usd'],
+                'take_profit_target': token_info['price_usd'] * 1.5,  # 50% profit
+                'stop_loss_level': token_info['price_usd'] * 0.8,     # 20% loss
+                'rug_score': rug_result['risk_score'],
+                'chart_signal': chart_result['signal'],
+                'chart_confidence': chart_result['score'],
+                'generated_at': datetime.now().isoformat(),
+            }
+            
+            logger.info(f"[OK] Execution plan ready: Buy {amount_lamports/1e9:.4f} SOL of {token_info['symbol']}")
+            return plan
+            
+        except Exception as e:
+            logger.error(f"Error generating execution plan: {e}")
+            return None
+
+
+# Test
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    executor = TradeExecutor("https://mainnet.helius-rpc.com/?api-key=test")
+    
+    print("\n" + "="*70)
+    print("TRADE EXECUTOR TEST")
+    print("="*70)
+    
+    # Test 1: Get prices
+    print("\n[Test 1] Fetching token prices...")
+    prices = executor.get_token_prices([
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+        executor.WRAPPED_SOL,
+    ])
+    for mint, price in prices.items():
+        print(f"  {mint[:8]}...: ${price:.8f}")
+    
+    # Test 2: Get swap quote
+    print("\n[Test 2] Getting swap quote...")
+    quote = executor.get_swap_quote(
+        executor.WRAPPED_SOL,
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        int(0.1 * 1e9),  # 0.1 SOL
+    )
+    if quote:
+        print(f"  Output: {quote['output_amount']} tokens")
+        print(f"  Impact: {quote['price_impact_pct']:.2f}%")
+    
+    # Test 3: Validate swap safety
+    print("\n[Test 3] Validating swap safety...")
+    if quote:
+        is_safe, msg = executor.validate_swap_safety(quote)
+        print(f"  Safe: {is_safe} - {msg}")
+    
+    # Test 4: Estimate buy amount
+    print("\n[Test 4] Buy sizing...")
+    amount, risk = executor.estimate_buy_amount(1.0, risk_percentage=5.0)
+    print(f"  Amount: {amount/1e9:.4f} SOL (${risk:.2f})")
+    
+    print("\n" + "="*70)
+    print("[OK] TRADE EXECUTOR TEST COMPLETE")
+    print("="*70)
