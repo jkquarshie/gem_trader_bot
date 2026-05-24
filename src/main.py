@@ -204,6 +204,9 @@ class GemTraderBot:
         logger.info("GEM TRADER BOT STARTING")
         logger.info("=" * 60)
         
+        # Start healthcheck HTTP server (required for Railway)
+        health_task = asyncio.create_task(self._run_health_server())
+        
         # Start Telegram bot polling if configured
         polling_task = None
         if self.bot:
@@ -246,7 +249,26 @@ class GemTraderBot:
         except Exception as e:
             logger.error(f"Fatal error: {e}")
         finally:
-            await self._shutdown(polling_task)
+            await self._shutdown(polling_task, health_task)
+    
+    async def _run_health_server(self):
+        """Minimal HTTP healthcheck server for Railway."""
+        port = int(os.getenv('PORT', 8080))
+        logger.info(f"Starting healthcheck server on port {port}")
+        
+        async def handle(reader, writer):
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            await writer.drain()
+            writer.close()
+        
+        try:
+            server = await asyncio.start_server(handle, '0.0.0.0', port)
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Health server error (non-fatal): {e}")
     
     async def _run_telegram_polling(self):
         """Run Telegram polling in background."""
@@ -255,13 +277,15 @@ class GemTraderBot:
         except Exception as e:
             logger.error(f"Telegram polling error: {e}")
     
-    async def _shutdown(self, polling_task=None):
+    async def _shutdown(self, polling_task=None, health_task=None):
         """Graceful shutdown."""
         logger.info("Shutting down...")
         self.running = False
         
         if polling_task:
             polling_task.cancel()
+        if health_task:
+            health_task.cancel()
         
         if self.bot:
             try:
