@@ -11,13 +11,19 @@ import signal
 import sys
 from datetime import datetime
 from dotenv import load_dotenv
+from pathlib import Path
 
-from src.scanner import TokenScanner
-from src.rug_checker import RugChecker
-from src.chart_analyzer import ChartAnalyzer
-from src.trade_executor import TradeExecutor
-from src.telegram_bot import TradeBot
-from src.logger import logger
+# Add project root to path (needed when running as python src/main.py)
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
+from scanner import TokenScanner
+from rug_checker import RugChecker
+from chart_analyzer import ChartAnalyzer
+from trade_executor import TradeExecutor
+from telegram_bot import TradeBot
+from logger import logger
 
 load_dotenv()
 
