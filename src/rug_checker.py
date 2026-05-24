@@ -65,13 +65,16 @@ class RugChecker:
                 'timestamp': datetime.now().isoformat()
             }
         
+        # Fetch mint data once, share across checks
+        mint_data = self._fetch_mint_data(token_mint)
+
         checks = {
-            'mint_authority_renounced': self._check_mint_authority(token_mint),
-            'freeze_authority_present': self._check_freeze_authority(token_mint),
+            'mint_authority_renounced': self._check_mint_authority(token_mint, mint_data),
+            'freeze_authority_present': self._check_freeze_authority(token_mint, mint_data),
             'holder_concentration': self._check_holder_concentration(token_mint),
             'liquidity_locked': self._check_liquidity_locked(token_mint),
             'honeypot_test': self._test_honeypot(token_mint),
-            'creator_history': self._check_creator_history(token_mint),
+            'creator_history': self._check_creator_history(token_mint, mint_data),
         }
         
         # Calculate risk score (0-100, higher = more risky)
@@ -130,36 +133,41 @@ class RugChecker:
         """
         Decode SPL token mint account data from base64.
         Returns dict with mint_authority, freeze_authority, supply, decimals.
+
+        SPL Mint layout (COption-prefixed pubkeys):
+         0-3:   mint_authority tag (0=None, 1=Some)
+         4-35:  mint_authority pubkey
+         36-43: supply (u64 LE)
+         44:    decimals (u8)
+         45:    is_initialized (bool)
+         46-49: freeze_authority tag (0=None, 1=Some)
+         50-81: freeze_authority pubkey
         """
         try:
             import base64
             data = base64.b64decode(account_data_b64)
-            
-            # SPL Mint structure (simplified):
-            # 0: mint_authority (32 bytes pubkey or null)
-            # 36: supply (8 bytes u64)
-            # 44: decimals (1 byte)
-            # 45: is_initialized (1 byte)
-            # 46: freeze_authority (32 bytes pubkey or null)
-            # ... more fields
-            
+
             if len(data) < 82:
                 return None
-            
-            # Parse mint_authority (bytes 0-31)
-            mint_auth_bytes = data[0:32]
-            mint_authority = None if mint_auth_bytes == b'\x00' * 32 else mint_auth_bytes.hex()
-            
-            # Parse supply (bytes 36-43, little-endian u64)
+
+            # Mint authority: 4-byte tag + 32-byte pubkey
+            mint_tag = struct.unpack('<I', data[0:4])[0]
+            mint_authority = None
+            if mint_tag == 1:
+                mint_authority = data[4:36].hex()
+
+            # Supply (bytes 36-43, little-endian u64)
             supply = struct.unpack('<Q', data[36:44])[0]
-            
-            # Parse decimals (byte 44)
+
+            # Decimals (byte 44)
             decimals = data[44]
-            
-            # Parse freeze_authority (bytes 46-77)
-            freeze_auth_bytes = data[46:78]
-            freeze_authority = None if freeze_auth_bytes == b'\x00' * 32 else freeze_auth_bytes.hex()
-            
+
+            # Freeze authority: 4-byte tag + 32-byte pubkey at offset 46
+            freeze_tag = struct.unpack('<I', data[46:50])[0]
+            freeze_authority = None
+            if freeze_tag == 1:
+                freeze_authority = data[50:82].hex()
+
             return {
                 'mint_authority': mint_authority,
                 'freeze_authority': freeze_authority,
@@ -170,76 +178,54 @@ class RugChecker:
             logger.error(f"Error decoding mint data: {e}")
             return None
     
-    def _check_mint_authority(self, token_mint: str) -> bool:
+    def _fetch_mint_data(self, token_mint: str) -> Optional[Dict]:
+        """Fetch and decode mint account data once, shared across checks."""
+        result = self._rpc_call("getAccountInfo", [token_mint, {"encoding": "base64"}])
+        if not result or not result.get('value'):
+            logger.warning(f"Could not fetch mint data for {token_mint}")
+            return None
+        account_data_b64 = result['value'].get('data', [None])[0]
+        if not account_data_b64:
+            return None
+        return self._decode_mint_data(account_data_b64)
+
+    def _check_mint_authority(self, token_mint: str, mint_data: Optional[Dict] = None) -> bool:
         """
         Check if mint authority has been renounced.
         Returns True if renounced (safe), False if active (risky).
         """
         logger.info(f"Checking mint authority for {token_mint}")
-        
-        try:
-            # Get account info in base64
-            result = self._rpc_call("getAccountInfo", [token_mint, {"encoding": "base64"}])
-            
-            if not result or not result.get('value'):
-                logger.warning(f"Could not fetch mint data for {token_mint}")
-                return False
-            
-            account_data_b64 = result['value'].get('data', [None])[0]
-            if not account_data_b64:
-                logger.warning(f"No data for {token_mint}")
-                return False
-            
-            mint_data = self._decode_mint_data(account_data_b64)
-            if not mint_data:
-                return False
-            
-            mint_authority = mint_data.get('mint_authority')
-            
-            if mint_authority is None:
-                logger.info(f"[OK] Mint authority renounced for {token_mint}")
-                return True
-            else:
-                logger.warning(f"[!] Mint authority still active")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error checking mint authority: {e}")
+
+        if not mint_data:
+            return False
+
+        mint_authority = mint_data.get('mint_authority')
+
+        if mint_authority is None:
+            logger.info(f"[OK] Mint authority renounced for {token_mint}")
+            return True
+        else:
+            logger.warning(f"[!] Mint authority still active")
             return False
     
-    def _check_freeze_authority(self, token_mint: str) -> bool:
+    def _check_freeze_authority(self, token_mint: str, mint_data: Optional[Dict] = None) -> bool:
         """
         Check if freeze authority exists (risky).
         Returns True if freeze authority is present (bad), False if absent (good).
         """
         logger.info(f"Checking freeze authority for {token_mint}")
-        
-        try:
-            result = self._rpc_call("getAccountInfo", [token_mint, {"encoding": "base64"}])
-            
-            if not result or not result.get('value'):
-                return False
-            
-            account_data_b64 = result['value'].get('data', [None])[0]
-            if not account_data_b64:
-                return False
-            
-            mint_data = self._decode_mint_data(account_data_b64)
-            if not mint_data:
-                return False
-            
-            freeze_authority = mint_data.get('freeze_authority')
-            
-            if freeze_authority is None:
-                logger.info(f"[OK] No freeze authority for {token_mint}")
-                return False
-            else:
-                logger.warning(f"[!] Freeze authority present")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error checking freeze authority: {e}")
+
+        if not mint_data:
             return False
+
+        freeze_authority = mint_data.get('freeze_authority')
+
+        if freeze_authority is None:
+            logger.info(f"[OK] No freeze authority for {token_mint}")
+            return False
+        else:
+            logger.warning(f"[!] Freeze authority present")
+            return True
     
     def _check_holder_concentration(self, token_mint: str) -> float:
         """
@@ -305,47 +291,33 @@ class RugChecker:
             logger.error(f"Error testing honeypot: {e}")
             return False
     
-    def _check_creator_history(self, token_mint: str) -> Dict:
+    def _check_creator_history(self, token_mint: str, mint_data: Optional[Dict] = None) -> Dict:
         """
         Check if token creator is a new wallet or has history of rugs.
         Returns dict with is_new_wallet and previous_rugs count.
         """
         logger.info(f"Checking creator history for {token_mint}")
-        
+
+        if not mint_data or not mint_data.get('mint_authority'):
+            return {'is_new_wallet': False, 'previous_rugs': 0}
+
+        creator = mint_data['mint_authority']
+
         try:
-            # Get the mint authority (creator) from metadata
-            result = self._rpc_call("getAccountInfo", [token_mint, {"encoding": "base64"}])
-            
-            if not result or not result.get('value'):
-                return {'is_new_wallet': False, 'previous_rugs': 0}
-            
-            account_data_b64 = result['value'].get('data', [None])[0]
-            if not account_data_b64:
-                return {'is_new_wallet': False, 'previous_rugs': 0}
-            
-            mint_data = self._decode_mint_data(account_data_b64)
-            if not mint_data or not mint_data.get('mint_authority'):
-                return {'is_new_wallet': False, 'previous_rugs': 0}
-            
-            creator = mint_data['mint_authority']
-            
-            # Query creator wallet for transaction history
-            # Simple check: if wallet has low lamports and recent creation, it's likely new
             creator_result = self._rpc_call("getAccountInfo", [creator])
-            
             if not creator_result or not creator_result.get('value'):
                 return {'is_new_wallet': False, 'previous_rugs': 0}
-            
+
             lamports = creator_result['value'].get('lamports', 0)
             is_new = lamports < 1000000  # Less than 0.01 SOL
-            
+
             logger.info(f"Token creator: new wallet = {is_new}")
-            
+
             return {
                 'is_new_wallet': is_new,
                 'previous_rugs': 0,  # TODO: Integrate with Rug Radar API
             }
-            
+
         except Exception as e:
             logger.error(f"Error checking creator history: {e}")
             return {'is_new_wallet': False, 'previous_rugs': 0}

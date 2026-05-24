@@ -60,7 +60,10 @@ class GemTraderBot:
         self.bot = TradeBot(
             token=self.telegram_token,
             chat_id=self.telegram_chat_id,
-            executor=self.executor
+            executor=self.executor,
+            scanner=self.scanner,
+            rug_checker=self.rug_checker,
+            chart_analyzer=self.chart_analyzer,
         ) if self.telegram_token else None
         
         # State

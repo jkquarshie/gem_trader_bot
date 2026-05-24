@@ -24,7 +24,7 @@ class TradeBot:
     Sends alerts, handles approve/skip decisions, monitors positions.
     """
     
-    def __init__(self, token: str, chat_id: str, executor=None):
+    def __init__(self, token: str, chat_id: str, executor=None, scanner=None, rug_checker=None, chart_analyzer=None):
         """
         Initialize the Telegram bot.
         
@@ -32,10 +32,16 @@ class TradeBot:
             token: Telegram bot token from @BotFather
             chat_id: Target chat ID for alerts
             executor: Optional trade executor instance
+            scanner: Token scanner for fetching token info
+            rug_checker: RugChecker for scam analysis
+            chart_analyzer: ChartAnalyzer for technical signals
         """
         self.token = token
         self.chat_id = chat_id
         self.executor = executor
+        self.scanner = scanner
+        self.rug_checker = rug_checker
+        self.chart_analyzer = chart_analyzer
         self.app = Application.builder().token(token).build()
         
         # Track pending trades and positions
@@ -54,6 +60,7 @@ class TradeBot:
         self.app.add_handler(CommandHandler("status", self._cmd_status))
         self.app.add_handler(CommandHandler("positions", self._cmd_positions))
         self.app.add_handler(CommandHandler("stop", self._cmd_stop))
+        self.app.add_handler(CommandHandler("check", self._cmd_check))
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
     
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,6 +68,7 @@ class TradeBot:
         await update.message.reply_text(
             "Gem Trader Bot is running!\n\n"
             "Commands:\n"
+            "/check <address> - Analyze a token contract\n"
             "/status - Bot status and recent activity\n"
             "/positions - View open positions\n"
             "/stop - Stop monitoring\n"
@@ -100,6 +108,64 @@ class TradeBot:
         if self.on_stop_callback:
             await self.on_stop_callback()
     
+    async def _cmd_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /check <address> command."""
+        args = context.args
+        if not args:
+            await update.message.reply_text("Usage: /check <token_mint_address>")
+            return
+
+        mint = args[0]
+        await update.message.reply_text(f"Analyzing {mint[:8]}... (this may take ~10s)")
+
+        try:
+            # Fetch token info from DexScreener
+            token_info = None
+            if self.scanner:
+                token_info = self.scanner.get_token_info(mint)
+
+            # Run rug check
+            rug = None
+            if self.rug_checker:
+                rug = self.rug_checker.check_token(mint)
+
+            # Chart analysis (only with price data)
+            chart = None
+            if self.chart_analyzer:
+                chart = self.chart_analyzer.analyze_token_chart(mint, token_data=token_info)
+
+            # Build response
+            lines = [f"Token: {mint}"]
+
+            if token_info:
+                lines.append(f"Symbol: {token_info.get('symbol', '?')}")
+                lines.append(f"Price: ${token_info.get('price_usd', 0):.8f}")
+                lines.append(f"Market Cap: ${float(token_info.get('market_cap_usd', 0)):,.0f}")
+                lines.append(f"Liquidity: ${token_info.get('liquidity_usd', 0):,.0f}")
+                lines.append(f"Vol 5m: ${float(token_info.get('volume_5m_usd', 0)):,.0f}")
+                lines.append(f"Vol 1h: ${float(token_info.get('volume_1h_usd', 0)):,.0f}")
+            else:
+                lines.append("Token info: Not found on DexScreener")
+
+            if rug:
+                score = rug['risk_score']
+                emoji = "LOW" if score < 30 else "MEDIUM" if score < 60 else "HIGH"
+                lines.append(f"Rug Risk: {emoji} ({score}/100)")
+                lines.append(f"Mint auth renounced: {'YES' if rug['checks']['mint_authority_renounced'] else 'NO'}")
+                lines.append(f"Freeze auth: {'YES (RISK!)' if rug['checks']['freeze_authority_present'] else 'none'}")
+                conc = rug['checks'].get('holder_concentration', 0)
+                lines.append(f"Top 10 holders: {conc:.1%}")
+
+            if chart:
+                lines.append(f"Signal: {chart['signal']} (confidence: {chart['score']}/100)")
+                lines.append(f"RSI(14): {chart['rsi']:.1f}")
+
+            await update.message.reply_text("```\n" + "\n".join(lines) + "\n```", parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /check: {e}")
+            await update.message.reply_text(f"Error analyzing token: {e}")
+
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Handle inline keyboard button presses.
