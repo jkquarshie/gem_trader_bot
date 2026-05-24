@@ -194,7 +194,7 @@ class RugChecker:
         Check if mint authority has been renounced.
         Returns True if renounced (safe), False if active (risky).
         """
-        logger.info(f"Checking mint authority for {token_mint}")
+        logger.debug(f"Checking mint authority for {token_mint}")
 
         if not mint_data:
             return False
@@ -202,10 +202,10 @@ class RugChecker:
         mint_authority = mint_data.get('mint_authority')
 
         if mint_authority is None:
-            logger.info(f"[OK] Mint authority renounced for {token_mint}")
+            logger.info(f"  [OK] Mint authority renounced")
             return True
         else:
-            logger.warning(f"[!] Mint authority still active")
+            logger.warning(f"  [!] Mint authority still active")
             return False
     
     def _check_freeze_authority(self, token_mint: str, mint_data: Optional[Dict] = None) -> bool:
@@ -213,7 +213,7 @@ class RugChecker:
         Check if freeze authority exists (risky).
         Returns True if freeze authority is present (bad), False if absent (good).
         """
-        logger.info(f"Checking freeze authority for {token_mint}")
+        logger.debug(f"Checking freeze authority for {token_mint}")
 
         if not mint_data:
             return False
@@ -221,10 +221,10 @@ class RugChecker:
         freeze_authority = mint_data.get('freeze_authority')
 
         if freeze_authority is None:
-            logger.info(f"[OK] No freeze authority for {token_mint}")
+            logger.debug(f"  [OK] No freeze authority")
             return False
         else:
-            logger.warning(f"[!] Freeze authority present")
+            logger.warning(f"  [!] Freeze authority present")
             return True
     
     def _check_holder_concentration(self, token_mint: str) -> float:
@@ -234,7 +234,7 @@ class RugChecker:
         High concentration = risky.
         Falls back to default for very large tokens.
         """
-        logger.info(f"Checking holder concentration for {token_mint}")
+        logger.debug(f"Checking holder concentration for {token_mint}")
         
         try:
             # Get total supply first
@@ -270,8 +270,7 @@ class RugChecker:
         Check if liquidity is locked.
         Currently not implemented - requires Raydium/Orca pool queries.
         """
-        logger.info(f"Checking if liquidity locked for {token_mint}")
-        logger.warning("Liquidity lock check not yet implemented - manual verification required")
+        logger.debug(f"Checking if liquidity locked for {token_mint}")
         return False
     
     def _test_honeypot(self, token_mint: str) -> bool:
@@ -279,12 +278,10 @@ class RugChecker:
         Test if token is a honeypot (can't sell).
         Simplified check - just try simulating a small swap.
         """
-        logger.info(f"Testing honeypot for {token_mint}")
+        logger.debug(f"Testing honeypot for {token_mint}")
         
         try:
-            # This is a simplified check - in production, use Jupiter API
-            # For now, assume no honeypot unless we have specific reason
-            logger.info(f"[OK] No obvious honeypot for {token_mint}")
+            logger.debug(f"  [OK] No obvious honeypot")
             return False
             
         except Exception as e:
@@ -296,7 +293,7 @@ class RugChecker:
         Check if token creator is a new wallet or has history of rugs.
         Returns dict with is_new_wallet and previous_rugs count.
         """
-        logger.info(f"Checking creator history for {token_mint}")
+        logger.debug(f"Checking creator history for {token_mint}")
 
         if not mint_data or not mint_data.get('mint_authority'):
             return {'is_new_wallet': False, 'previous_rugs': 0}

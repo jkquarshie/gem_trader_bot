@@ -104,7 +104,7 @@ class ChartAnalyzer:
                 rs = avg_gain / avg_loss
                 rsi = 100 - (100 / (1 + rs))
             
-            logger.info(f"RSI({period}): {rsi:.2f}")
+            logger.debug(f"RSI({period}): {rsi:.2f}")
             return rsi
             
         except Exception as e:
@@ -132,7 +132,7 @@ class ChartAnalyzer:
             support = min(recent_prices)
             resistance = max(recent_prices)
             
-            logger.info(f"Support: ${support:.8f}, Resistance: ${resistance:.8f}")
+            logger.debug(f"Support: ${support:.8f}, Resistance: ${resistance:.8f}")
             return (support, resistance)
             
         except Exception as e:
@@ -156,7 +156,7 @@ class ChartAnalyzer:
         
         try:
             ma = sum(prices[-period:]) / period
-            logger.info(f"MA({period}): ${ma:.8f}")
+            logger.debug(f"MA({period}): ${ma:.8f}")
             return ma
         except Exception as e:
             logger.error(f"Error calculating MA: {e}")
@@ -188,7 +188,7 @@ class ChartAnalyzer:
             else:
                 trend = "STABLE"
             
-            logger.info(f"Volume trend: {trend}")
+            logger.debug(f"Volume trend: {trend}")
             return trend
             
         except Exception as e:
@@ -227,7 +227,7 @@ class ChartAnalyzer:
         else:
             signal = "NORMAL"
         
-        logger.info(f"Volume spike: ratio={spike_ratio:.1f}x, signal={signal}")
+        logger.debug(f"Volume spike: ratio={spike_ratio:.1f}x, signal={signal}")
         
         return {
             'is_spiking': is_spiking,
@@ -302,7 +302,7 @@ class ChartAnalyzer:
                 'analyzed_at': datetime.now().isoformat(),
             }
             
-            logger.info(f"Chart analysis complete: {signal} (score: {score})")
+            logger.debug(f"Chart analysis complete: {signal} (score: {score})")
             return result
             
         except Exception as e:

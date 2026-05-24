@@ -44,7 +44,8 @@ class GemTraderBot:
         self.min_market_cap = float(os.getenv('MIN_MARKET_CAP_USD', 50000))
         self.min_age_minutes = int(os.getenv('MIN_AGE_MINUTES', 5))
         self.max_age = int(os.getenv('MAX_AGE_MINUTES', 60))
-        self.max_holder_pct = float(os.getenv('MAX_HOLDER_CONCENTRATION', 0.30))
+        self.max_holder_pct = float(os.getenv('MAX_HOLDER_CONCENTRATION', 0.50))
+        self.min_buy_sell_ratio = float(os.getenv('MIN_BUY_SELL_RATIO', 0.5))
         self.min_volume_5m = float(os.getenv('MIN_VOLUME_5M_USD', 1000))
         self.volume_spike_min_ratio = float(os.getenv('VOLUME_SPIKE_MIN_RATIO', 1.5))
         self.profit_target = float(os.getenv('PROFIT_TARGET_PERCENT', 100))
@@ -70,6 +71,7 @@ class GemTraderBot:
         self.running = True
         self.scanned_mints = set()  # Avoid re-scanning same tokens
         self.active_positions = {}
+        self._reset_filters()
         
         # Wire callbacks
         if self.bot:
@@ -147,7 +149,14 @@ class GemTraderBot:
                 
             except Exception as e:
                 logger.debug(f"Error monitoring {mint}: {e}")
-    
+
+    def _reset_filters(self):
+        self._filter_counts = {
+            'total': 0, 'market_cap': 0, 'age': 0, 'scam': 0,
+            'holder': 0, 'buy_sell': 0, 'volume': 0, 'chart': 0,
+            'execution': 0, 'alerts': 0,
+        }
+
     async def run_scan_cycle(self):
         """Run one full scan -> analyze -> alert cycle."""
         logger.info("Starting scan cycle...")
@@ -161,10 +170,13 @@ class GemTraderBot:
         if not trending:
             logger.info("No trending tokens found")
             return
-        
+
+        self._reset_filters()
+
         # Filter out already scanned
         new_tokens = [t for t in trending if t['mint'] not in self.scanned_mints]
-        
+        self._filter_counts['total'] = len(new_tokens)
+
         for token in new_tokens:
             if not self.running:
                 break
@@ -172,12 +184,13 @@ class GemTraderBot:
             mint = token['mint']
             self.scanned_mints.add(mint)
             
-            logger.info(f"Analyzing {token['symbol']} ({mint[:8]}...)")
+            logger.debug(f"Analyzing {token['symbol']} ({mint[:8]}...)")
             
             # Filter: market cap
             market_cap = token.get('market_cap_usd', 0)
             if self.min_market_cap > 0 and market_cap > 0 and market_cap < self.min_market_cap:
                 logger.info(f"  Market cap filter: SKIPPED (${market_cap} < ${self.min_market_cap})")
+                self._filter_counts['market_cap'] += 1
                 continue
             
             # Filter: token age
@@ -188,6 +201,7 @@ class GemTraderBot:
                     age_minutes = (datetime.now().timestamp() - created_ts) / 60
                     if age_minutes < self.min_age_minutes:
                         logger.info(f"  Age filter: SKIPPED ({age_minutes:.0f} min, need {self.min_age_minutes})")
+                        self._filter_counts['age'] += 1
                         continue
                 except Exception:
                     pass
@@ -197,18 +211,32 @@ class GemTraderBot:
             
             if rug_result['is_likely_scam']:
                 logger.info(f"  Scam filter: SKIPPED ({rug_result['risk_score']}/100)")
+                self._filter_counts['scam'] += 1
                 continue
             
             # Filter: holder concentration
             holder_pct = rug_result['checks'].get('holder_concentration', 0)
             if holder_pct > self.max_holder_pct:
-                logger.info(f"  Holder concentration filter: SKIPPED ({holder_pct:.0%} > {self.max_holder_pct:.0%})")
+                logger.info(f"  Holder filter: SKIPPED ({holder_pct:.0%} > {self.max_holder_pct:.0%})")
+                self._filter_counts['holder'] += 1
                 continue
-            
+
+            # Filter: buy/sell ratio (DexScreener txns data)
+            txns_5m = token.get('txns_5m', {})
+            buys_5m = int(txns_5m.get('buys', 0))
+            sells_5m = int(txns_5m.get('sells', 0))
+            if self.min_buy_sell_ratio > 0 and sells_5m > 0 and buys_5m > 0:
+                ratio = buys_5m / sells_5m
+                if ratio < self.min_buy_sell_ratio:
+                    logger.info(f"  Buy/sell filter: SKIPPED (ratio {ratio:.2f} < {self.min_buy_sell_ratio})")
+                    self._filter_counts['buy_sell'] += 1
+                    continue
+
             # Filter: volume spike (optional)
             vol_5m = float(token.get('volume_5m_usd', 0))
             if self.min_volume_5m > 0 and vol_5m > 0 and vol_5m < self.min_volume_5m:
                 logger.info(f"  Volume filter: SKIPPED (5m vol ${vol_5m:.0f} < ${self.min_volume_5m})")
+                self._filter_counts['volume'] += 1
                 continue
             
             # Stage 3: Chart analysis (with volume data)
@@ -216,6 +244,7 @@ class GemTraderBot:
             
             if chart_result['signal'] not in ['BUY', 'STRONG_BUY']:
                 logger.info(f"  Chart filter: SKIPPED ({chart_result['signal']})")
+                self._filter_counts['chart'] += 1
                 continue
             
             # Stage 4: Generate execution plan
@@ -229,18 +258,31 @@ class GemTraderBot:
             
             if not plan or plan['decision'] != 'EXECUTE':
                 logger.info(f"  Execution filter: SKIPPED ({plan.get('reason') if plan else 'No plan'})")
+                self._filter_counts['execution'] += 1
                 continue
             
             # Stage 5: Send Telegram alert
             if self.bot:
                 trade_id = await self.bot.send_alert(plan)
                 if trade_id:
+                    self._filter_counts['alerts'] += 1
                     logger.info(f"  Alert sent! Trade ID: {trade_id}")
                     await asyncio.sleep(5)
             else:
                 logger.info(f"  Trade ready (no Telegram configured): {token['symbol']}")
                 logger.info(f"  {plan}")
-    
+
+        # Cycle summary
+        c = self._filter_counts
+        filtered = c['total'] - c['alerts']
+        logger.info(
+            f"  Cycle: {c['total']} scanned, {filtered} filtered "
+            f"(cap:{c['market_cap']} age:{c['age']} scam:{c['scam']} "
+            f"hold:{c['holder']} bs:{c['buy_sell']} vol:{c['volume']} "
+            f"chart:{c['chart']} exec:{c['execution']}) "
+            f"→ {c['alerts']} alert(s)"
+        )
+
     async def run(self):
         """Main bot loop."""
         logger.info("=" * 60)

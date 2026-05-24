@@ -22,12 +22,73 @@ class TokenScanner:
     
     # API endpoints
     DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
+    DEXSCREENER_BOOSTS = "https://api.dexscreener.com/token-boosts/latest/v1"
+    DEXSCREENER_TOP_BOOSTS = "https://api.dexscreener.com/token-boosts/top/v1"
     RAYDIUM_API = "https://api.raydium.io/v2"
+    WRAPPED_SOL = "So11111111111111111111111111111111111111112"
     
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'GemTraderBot/1.0'})
     
+    def _is_suspicious_name(self, symbol: str, name: str, mint: str) -> bool:
+        """Quick check if a token is impersonating a known token."""
+        if not symbol:
+            return True
+        # Fake wrapped SOL / ETH / BTC impersonators
+        name_lower = (symbol + " " + name).lower()
+        if "sol" in name_lower and mint != self.WRAPPED_SOL:
+            return True
+        return False
+
+    def scan_boosted_tokens(self, use_top: bool = False, min_liquidity_usd: float = 5000, limit: int = 10) -> List[Dict]:
+        """
+        Scan DexScreener boosted tokens (truly trending, not text-search noise).
+        """
+        url = self.DEXSCREENER_TOP_BOOSTS if use_top else self.DEXSCREENER_BOOSTS
+        logger.info(f"Scanning boosted tokens from {url}")
+        candidates = []
+
+        try:
+            resp = self.session.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            for entry in (data or []):
+                try:
+                    chain = entry.get("chainId", "")
+                    if chain != "solana":
+                        continue
+
+                    base = entry.get("baseToken", {})
+                    mint = base.get("address", "")
+                    if not mint:
+                        continue
+
+                    # Quick fake-name filter before API call
+                    symbol = base.get("symbol", "")
+                    name = base.get("name", "")
+                    if self._is_suspicious_name(symbol, name, mint):
+                        continue
+
+                    token_info = self.get_token_info(mint)
+                    if not token_info:
+                        continue
+                    if token_info.get("liquidity_usd", 0) < min_liquidity_usd:
+                        continue
+
+                    candidates.append(token_info)
+                    if len(candidates) >= limit:
+                        break
+                except Exception:
+                    continue
+
+            logger.info(f"Found {len(candidates)} boosted tokens")
+        except Exception as e:
+            logger.error(f"Error scanning boosted tokens: {e}")
+
+        return candidates
+
     def scan_new_tokens(self, age_minutes: int = 30, min_liquidity_usd: float = 10000, limit: int = 20) -> List[Dict]:
         """
         Scan for new tokens created in the last N minutes with minimum liquidity.
@@ -138,25 +199,33 @@ class TokenScanner:
         
         return candidates
     
-    def scan_trending_tokens(self, top_n: int = 20, min_liquidity_usd: float = 50000) -> List[Dict]:
+    def scan_trending_tokens(self, top_n: int = 20, min_liquidity_usd: float = 5000) -> List[Dict]:
         """
-        Scan for tokens with highest trading activity.
+        Scan for trending tokens using DexScreener boosts API (primary)
+        with text-search fallback.
         
         Args:
-            top_n: Return top N tokens by volume
+            top_n: Return top N tokens
             min_liquidity_usd: Minimum liquidity filter
         
         Returns:
             List of trending token dicts
         """
-        logger.info(f"Scanning for trending tokens (top {top_n}, min liquidity ${min_liquidity_usd})")
-        
-        trending = []
-        
+        # Try boosts API first (much cleaner signal)
+        boosted = self.scan_boosted_tokens(use_top=True, min_liquidity_usd=min_liquidity_usd, limit=top_n)
+        if len(boosted) >= top_n:
+            logger.info(f"Found {len(boosted)} boosted tokens (using boosts API)")
+            return boosted
+
+        seen_mints = {t['mint'] for t in boosted}
+
+        logger.info(f"Scanning trending via search (need {top_n - len(boosted)} more)")
+
+        trending = list(boosted)
+
         try:
-            # Search for trending/popular tokens by searching common terms
             search_queries = ["solana", "trending", "dex"]
-            
+
             for query in search_queries:
                 try:
                     response = self.session.get(
@@ -166,47 +235,47 @@ class TokenScanner:
                     )
                     response.raise_for_status()
                     data = response.json()
-                    
+
                     if 'pairs' not in data:
                         continue
-                    
-                    # Sort by 24h volume
+
                     pairs_sorted = sorted(
                         data['pairs'],
                         key=lambda p: float(p.get('volume', {}).get('h24', 0)) if p.get('volume') else 0,
                         reverse=True
                     )
-                    
+
                     for pair in pairs_sorted:
                         try:
-                            # Only process Solana tokens
                             if pair.get('chainId') != 'solana':
                                 continue
-                            
+
                             base_token = pair.get('baseToken', {})
-                            liquidity = pair.get('liquidity', {})
-                            liquidity_usd = float(liquidity.get('usd', 0)) if liquidity else 0
-                            
-                            # Skip low liquidity
-                            if liquidity_usd < min_liquidity_usd:
-                                continue
-                            
                             token_mint = base_token.get('address', '')
                             if not token_mint:
                                 continue
-                            
-                            # Skip stablecoins
+
+                            # Skip known fakes and stablecoins
                             symbol = base_token.get('symbol', '')
+                            name = base_token.get('name', '')
                             if symbol in ['USDC', 'USDT', 'BUSD']:
                                 continue
-                            
-                            # Skip if already in list
-                            if any(t['mint'] == token_mint for t in trending):
+                            if self._is_suspicious_name(symbol, name, token_mint):
                                 continue
-                            
+
+                            # Skip already seen
+                            if token_mint in seen_mints:
+                                continue
+                            seen_mints.add(token_mint)
+
+                            liquidity = pair.get('liquidity', {})
+                            liquidity_usd = float(liquidity.get('usd', 0)) if liquidity else 0
+                            if liquidity_usd < min_liquidity_usd:
+                                continue
+
                             trending.append({
                                 'mint': token_mint,
-                                'name': base_token.get('name', ''),
+                                'name': name,
                                 'symbol': symbol,
                                 'price_usd': float(pair.get('priceUsd', 0)),
                                 'liquidity_usd': liquidity_usd,
@@ -221,24 +290,22 @@ class TokenScanner:
                                 'dex_id': pair.get('dexId', ''),
                                 'discovered_at': datetime.now().isoformat(),
                             })
-                            
+
                             if len(trending) >= top_n:
                                 break
-                                
-                        except Exception as e:
-                            logger.debug(f"Error processing trending pair: {e}")
+
+                        except Exception:
                             continue
-                    
+
                     if len(trending) >= top_n:
                         break
-                        
-                except Exception as e:
-                    logger.debug(f"Error searching for '{query}': {e}")
+
+                except Exception:
                     continue
-            
+
             logger.info(f"Found {len(trending)} trending tokens")
             return trending
-            
+
         except Exception as e:
             logger.error(f"Error scanning trending tokens: {e}")
             return []
