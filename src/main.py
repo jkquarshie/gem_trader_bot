@@ -280,7 +280,7 @@ class GemTraderBot:
     async def _run_telegram_polling(self):
         """Run Telegram polling in background."""
         try:
-            await self.bot.app.updater.start_polling(read_timeout=30)
+            await self.bot.app.updater.start_polling()
         except Exception as e:
             logger.error(f"Telegram polling error: {e}")
     
