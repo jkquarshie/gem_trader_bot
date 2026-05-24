@@ -219,6 +219,7 @@ class GemTraderBot:
             logger.info("Starting Telegram bot...")
             self.bot.register_handlers()
             await self.bot.app.initialize()
+            await self.bot.app.start()
             polling_task = asyncio.create_task(self._run_telegram_polling())
             
             # Send startup notification
