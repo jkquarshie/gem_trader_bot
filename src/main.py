@@ -103,18 +103,24 @@ class GemTraderBot:
             logger.info("No wallet key configured — trades will be simulated")
             return None
 
+        logger.info(f"Attempting to load keypair (raw length: {len(raw)})")
         try:
             # Try: JSON array from Phantom export [1,2,3,...]
             if raw.startswith('['):
+                logger.info("Detected JSON array format")
                 secret_bytes = bytes(json.loads(raw))
             else:
                 # Try: base64 encoded
+                logger.info("Attempting base64 decode")
                 secret_bytes = base64.b64decode(raw)
+            logger.info(f"Decoded {len(secret_bytes)} bytes")
             kp = Keypair.from_bytes(secret_bytes)
             logger.info(f"[OK] Wallet loaded: {kp.pubkey()}")
             return kp
         except Exception as e:
-            logger.error(f"Failed to load keypair: {e}")
+            logger.error(f"Failed to load keypair: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     async def _on_trade_approved(self, trade_plan: dict) -> bool:
