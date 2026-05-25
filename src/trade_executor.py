@@ -254,6 +254,122 @@ class TradeExecutor:
             logger.error(f"Error testing honeypot: {e}")
             return (False, f"Test failed: {e}")
     
+    def create_position(self, token_info: Dict, chart_result: Dict = None,
+                        buy_amount_sol: float = 0.05, entry_price: float = None,
+                        tp1_pct: float = 50.0, tp1_sell_pct: float = 30.0,
+                        tp2_pct: float = 100.0, tp2_sell_pct: float = 30.0,
+                        tp3_pct: float = 200.0, tp3_sell_pct: float = 40.0,
+                        stop_loss_pct: float = 20.0) -> Dict:
+        """
+        Create a tracked position with multi-level TP/SL.
+
+        Auto-calculates entry price from current price or chart support level.
+        """
+        if entry_price is None or entry_price <= 0:
+            entry_price = token_info.get('price_usd', 0)
+            # Use chart support as a more conservative entry if available
+            if chart_result and chart_result.get('support', 0) > 0:
+                entry_price = min(entry_price, chart_result['support'])
+
+        mint = token_info['mint']
+        total_tokens = int(buy_amount_sol / entry_price) if entry_price > 0 else 0
+
+        position = {
+            'mint': mint,
+            'symbol': token_info.get('symbol', mint[:8]),
+            'entry_price': entry_price,
+            'total_tokens': total_tokens,
+            'remaining_tokens': total_tokens,
+            'total_cost_sol': buy_amount_sol,
+            'entry_time': datetime.now().isoformat(),
+            'status': 'ACTIVE',
+            'tp_levels': [
+                {'level': 1, 'pct': tp1_pct, 'sell_pct': tp1_sell_pct,
+                 'triggered': False, 'sold_at': None, 'sold_price': None},
+                {'level': 2, 'pct': tp2_pct, 'sell_pct': tp2_sell_pct,
+                 'triggered': False, 'sold_at': None, 'sold_price': None},
+                {'level': 3, 'pct': tp3_pct, 'sell_pct': tp3_sell_pct,
+                 'triggered': False, 'sold_at': None, 'sold_price': None},
+            ],
+            'stop_loss_pct': stop_loss_pct,
+            'stop_loss_triggered': False,
+            'simulated': True,
+        }
+
+        self.positions[mint] = position
+        logger.info(f"Position created: {buy_amount_sol:.4f} SOL of {token_info['symbol']} at ${entry_price:.8f}")
+        return position
+
+    def check_tp_sl(self, mint: str, current_price: float) -> Optional[Dict]:
+        """
+        Check active positions for TP/SL triggers.
+
+        Returns dict with triggered actions if any, else None.
+        """
+        position = self.positions.get(mint)
+        if not position or position['status'] not in ('ACTIVE', 'PARTIAL'):
+            return None
+
+        actions = []
+        pnl_pct = ((current_price - position['entry_price']) / position['entry_price']) * 100
+
+        # Check stop loss
+        if not position.get('stop_loss_triggered'):
+            sl_pct = position.get('stop_loss_pct', 20)
+            if pnl_pct <= -sl_pct:
+                position['stop_loss_triggered'] = True
+                position['remaining_tokens'] = 0
+                position['status'] = 'CLOSED'
+                actions.append({
+                    'type': 'STOP_LOSS',
+                    'pnl_pct': pnl_pct,
+                    'sell_tokens': position['total_tokens'],
+                })
+
+        # Check TP levels (in order)
+        if not actions:
+            for tp in position['tp_levels']:
+                if tp['triggered']:
+                    continue
+                if pnl_pct >= tp['pct']:
+                    tp['triggered'] = True
+                    tp['sold_at'] = datetime.now().isoformat()
+                    tp['sold_price'] = current_price
+
+                    sell_tokens = int(position['total_tokens'] * tp['sell_pct'] / 100)
+                    position['remaining_tokens'] -= sell_tokens
+                    if position['remaining_tokens'] <= 0:
+                        position['remaining_tokens'] = 0
+                        position['status'] = 'CLOSED'
+                    elif position['status'] == 'ACTIVE':
+                        position['status'] = 'PARTIAL'
+
+                    actions.append({
+                        'type': f'TP{tp["level"]}',
+                        'pnl_pct': pnl_pct,
+                        'sell_pct': tp['sell_pct'],
+                        'sell_tokens': sell_tokens,
+                        'remaining_pct': (position['remaining_tokens'] / position['total_tokens'] * 100)
+                        if position['total_tokens'] > 0 else 0,
+                    })
+
+        if actions:
+            result = {
+                'mint': position['mint'],
+                'symbol': position['symbol'],
+                'entry_price': position['entry_price'],
+                'current_price': current_price,
+                'pnl_pct': pnl_pct,
+                'actions': actions,
+                'remaining_tokens': position['remaining_tokens'],
+                'status': position['status'],
+                'simulated': position.get('simulated', True),
+            }
+            logger.info(f"TP/SL triggered for {position['symbol']}: {[a['type'] for a in actions]}")
+            return result
+
+        return None
+
     def record_position(self, token_mint: str, amount: int, entry_price: float):
         """Record a bought position."""
         self.positions[token_mint] = {

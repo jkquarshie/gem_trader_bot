@@ -49,9 +49,17 @@ class GemTraderBot:
         self.min_volume_5m = float(os.getenv('MIN_VOLUME_5M_USD', 1000))
         self.volume_spike_min_ratio = float(os.getenv('VOLUME_SPIKE_MIN_RATIO', 1.5))
         self.profit_target = float(os.getenv('PROFIT_TARGET_PERCENT', 100))
-        self.stop_loss = float(os.getenv('STOP_LOSS_PERCENT', 10))
+        self.stop_loss = float(os.getenv('STOP_LOSS_PERCENT', 20))
         self.risk_per_trade = float(os.getenv('RISK_PERCENT', 5))
         self.wallet_balance_sol = float(os.getenv('WALLET_BALANCE_SOL', 1.0))
+
+        # Multi-level TP/SL defaults
+        self.tp1_pct = float(os.getenv('TP1_PERCENT', 50))
+        self.tp1_sell_pct = float(os.getenv('TP1_SELL_PERCENT', 30))
+        self.tp2_pct = float(os.getenv('TP2_PERCENT', 100))
+        self.tp2_sell_pct = float(os.getenv('TP2_SELL_PERCENT', 30))
+        self.tp3_pct = float(os.getenv('TP3_PERCENT', 200))
+        self.tp3_sell_pct = float(os.getenv('TP3_SELL_PERCENT', 40))
         
         # Initialize modules
         self.scanner = TokenScanner()
@@ -78,31 +86,88 @@ class GemTraderBot:
             self.bot.on_approve_callback = self._on_trade_approved
             self.bot.on_skip_callback = self._on_trade_skipped
             self.bot.on_stop_callback = self._on_stop_requested
+            self.bot.on_trade_callback = self._on_trade_requested
     
     async def _on_trade_approved(self, trade_plan: dict) -> bool:
-        """Handle user approving a trade."""
+        """Handle user approving a trade from automatic scan."""
         try:
             logger.info(f"Trade approved: {trade_plan.get('token')}")
-            
-            # Track position
+
             mint = trade_plan.get('token_mint')
-            if mint:
-                self.active_positions[mint] = {
-                    'symbol': trade_plan.get('token'),
-                    'entry_price': trade_plan.get('entry_price'),
-                    'amount_sol': trade_plan.get('buy_amount_sol'),
-                    'entry_time': datetime.now().isoformat(),
-                }
-            
+            if mint and self.scanner:
+                token_info = self.scanner.get_token_info(mint)
+                if not token_info:
+                    return False
+                entry_price = token_info.get('price_usd', trade_plan.get('entry_price', 0))
+                buy_amount = trade_plan.get('buy_amount_sol', 0.05)
+
+                # Create tracked position with multi-TP
+                pos = self.executor.create_position(
+                    token_info=token_info,
+                    buy_amount_sol=buy_amount,
+                    entry_price=entry_price,
+                    tp1_pct=self.tp1_pct, tp1_sell_pct=self.tp1_sell_pct,
+                    tp2_pct=self.tp2_pct, tp2_sell_pct=self.tp2_sell_pct,
+                    tp3_pct=self.tp3_pct, tp3_sell_pct=self.tp3_sell_pct,
+                    stop_loss_pct=self.stop_loss,
+                )
+                self.active_positions[mint] = pos
+
             # TODO: Generate and sign Jupiter swap transaction
-            # This requires the user's wallet keypair
-            
+            # Requires wallet keypair on Railway
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
             return False
-    
+
+    async def _on_trade_requested(self, mint: str, amount_sol: float):
+        """
+        Handle user requesting a trade via /check or /trade.
+        Returns (success, message).
+        """
+        try:
+            logger.info(f"Trade requested: {mint[:8]} ({amount_sol} SOL)")
+
+            token_info = self.scanner.get_token_info(mint)
+            if not token_info:
+                return (False, "Token not found on DexScreener.")
+
+            rug = self.rug_checker.check_token(mint)
+            if rug['is_likely_scam']:
+                return (False, f"Scam risk too high ({rug['risk_score']}/100).")
+
+            chart = self.chart_analyzer.analyze_token_chart(mint, token_data=token_info)
+
+            pos = self.executor.create_position(
+                token_info=token_info,
+                chart_result=chart,
+                buy_amount_sol=amount_sol,
+                tp1_pct=self.tp1_pct, tp1_sell_pct=self.tp1_sell_pct,
+                tp2_pct=self.tp2_pct, tp2_sell_pct=self.tp2_sell_pct,
+                tp3_pct=self.tp3_pct, tp3_sell_pct=self.tp3_sell_pct,
+                stop_loss_pct=self.stop_loss,
+            )
+            self.active_positions[mint] = pos
+
+            msg = (
+                f"[SIMULATED] Position opened:\n"
+                f"{token_info.get('symbol', mint[:8])} | {amount_sol:.4f} SOL @ ${pos['entry_price']:.8f}\n"
+                f"TP1: +{self.tp1_pct:.0f}%→sell {self.tp1_sell_pct:.0f}%  "
+                f"TP2: +{self.tp2_pct:.0f}%→sell {self.tp2_sell_pct:.0f}%  "
+                f"TP3: +{self.tp3_pct:.0f}%→sell {self.tp3_sell_pct:.0f}%\n"
+                f"SL: -{self.stop_loss:.0f}%→sell 100%\n\n"
+                f"⚠ Simulated — add SOLANA_PRIVATE_KEY to Railway for real execution."
+            )
+
+            logger.info(f"Position tracked: {token_info['symbol']} ({mint[:8]})")
+            return (True, msg)
+
+        except Exception as e:
+            logger.error(f"Error in trade request: {e}")
+            return (False, str(e))
+
     async def _on_trade_skipped(self, trade_id: str):
         """Handle user skipping a trade."""
         logger.info(f"Trade {trade_id} skipped by user")
@@ -113,40 +178,43 @@ class GemTraderBot:
         self.running = False
     
     async def _monitor_positions(self):
-        """Check active positions for TP/SL."""
+        """Check active positions for multi-TP/SL triggers."""
         if not self.active_positions:
             return
-        
-        for mint, pos in list(self.active_positions.items()):
+
+        for mint in list(self.active_positions.keys()):
             try:
-                # Get current price
                 token_info = self.scanner.get_token_info(mint)
                 if not token_info:
                     continue
-                
+
                 current_price = token_info.get('price_usd', 0)
-                
-                # Calculate P&L
-                pnl = self.executor.calculate_pnl(mint, current_price)
-                if not pnl:
+                if current_price <= 0:
                     continue
-                
-                # Check exit conditions
-                action = self.executor.check_exit_condition(
-                    mint, current_price,
-                    take_profit_pct=self.profit_target,
-                    stop_loss_pct=self.stop_loss
-                )
-                
-                # Send update if triggered
-                if action and self.bot:
-                    pnl['action'] = action
-                    await self.bot.send_position_update(mint, pnl)
-                    
-                    if action in ['TAKE_PROFIT', 'STOP_LOSS']:
-                        logger.info(f"Exit triggered for {pos['symbol']}: {action}")
-                        # Position remains until user sells
-                
+
+                # Check multi-TP/SL triggers
+                triggered = self.executor.check_tp_sl(mint, current_price)
+                if triggered and self.bot:
+                    for action in triggered['actions']:
+                        label = action['type']
+                        pnl = action['pnl_pct']
+                        sim = " [SIMULATED]" if triggered['simulated'] else ""
+                        msg = (
+                            f"{triggered['symbol']}: {label} hit!{sim}\n"
+                            f"P&L: {pnl:+.2f}%\n"
+                        )
+                        if label == 'STOP_LOSS':
+                            msg += f"Sold 100% at ${current_price:.8f}"
+                        else:
+                            msg += (
+                                f"Sold {action['sell_pct']:.0f}% at ${current_price:.8f}\n"
+                                f"Remaining: {action['remaining_pct']:.0f}%"
+                            )
+                        if triggered['status'] == 'CLOSED':
+                            msg += "\nPosition fully closed."
+
+                        await self.bot.send_notification(msg)
+
             except Exception as e:
                 logger.debug(f"Error monitoring {mint}: {e}")
 

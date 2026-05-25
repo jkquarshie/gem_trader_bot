@@ -53,6 +53,7 @@ class TradeBot:
         self.on_approve_callback = None
         self.on_skip_callback = None
         self.on_sell_callback = None
+        self.on_trade_callback = None  # Called when user confirms a trade
     
     def register_handlers(self):
         """Register command and callback handlers."""
@@ -61,6 +62,7 @@ class TradeBot:
         self.app.add_handler(CommandHandler("positions", self._cmd_positions))
         self.app.add_handler(CommandHandler("stop", self._cmd_stop))
         self.app.add_handler(CommandHandler("check", self._cmd_check))
+        self.app.add_handler(CommandHandler("trade", self._cmd_trade))
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
     
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -69,6 +71,7 @@ class TradeBot:
             "Gem Trader Bot is running!\n\n"
             "Commands:\n"
             "/check <address> - Analyze a token contract\n"
+            "/trade <address> [amount_sol] - Open a trade with auto TP/SL\n"
             "/status - Bot status and recent activity\n"
             "/positions - View open positions\n"
             "/stop - Stop monitoring\n"
@@ -160,11 +163,98 @@ class TradeBot:
                 lines.append(f"Signal: {chart['signal']} (confidence: {chart['score']}/100)")
                 lines.append(f"RSI(14): {chart['rsi']:.1f}")
 
-            await update.message.reply_text("```\n" + "\n".join(lines) + "\n```", parse_mode='Markdown')
+            body = "```\n" + "\n".join(lines) + "\n```"
+
+            # Only show trade buttons if we have token info and rug check
+            if token_info and rug and rug['risk_score'] < 60:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("TRADE 0.05 SOL", callback_data=f"trade_quick:{mint}:0.05"),
+                        InlineKeyboardButton("TRADE 0.1 SOL", callback_data=f"trade_quick:{mint}:0.1"),
+                    ],
+                    [InlineKeyboardButton("CUSTOM AMOUNT", callback_data=f"trade_custom:{mint}")],
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text(body, parse_mode='Markdown', reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(body, parse_mode='Markdown')
 
         except Exception as e:
             logger.error(f"Error in /check: {e}")
             await update.message.reply_text(f"Error analyzing token: {e}")
+
+    async def _cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /trade <mint> [amount_sol] command."""
+        args = context.args
+        if not args:
+            await update.message.reply_text("Usage: /trade <token_mint_address> [amount_sol]")
+            return
+
+        mint = args[0]
+        amount_sol = float(args[1]) if len(args) > 1 and args[1] else 0.05
+
+        if not self.scanner or not self.rug_checker or not self.chart_analyzer:
+            await update.message.reply_text("Bot modules not loaded.")
+            return
+
+        await update.message.reply_text(f"Analyzing {mint[:8]} for trade setup...")
+
+        try:
+            token_info = self.scanner.get_token_info(mint)
+            if not token_info:
+                await update.message.reply_text("Token not found on DexScreener.")
+                return
+
+            rug = self.rug_checker.check_token(mint)
+            if rug['is_likely_scam']:
+                await update.message.reply_text(f"Scam risk too high ({rug['risk_score']}/100). Trade cancelled.")
+                return
+
+            chart = self.chart_analyzer.analyze_token_chart(mint, token_data=token_info)
+
+            msg = (
+                f"Trade Setup: {token_info.get('symbol', mint[:8])}\n"
+                f"Entry: ${token_info['price_usd']:.8f}\n"
+                f"Amount: {amount_sol:.4f} SOL\n"
+                f"Risk: {rug['risk_score']}/100\n"
+                f"Signal: {chart['signal']} ({chart['score']}/100)\n\n"
+                f"TP1: +50% → sell 30%\n"
+                f"TP2: +100% → sell 30%\n"
+                f"TP3: +200% → sell 40%\n"
+                f"SL: -20% → sell 100%\n"
+                f"(Use env vars TP1_PERCENT, TP2_PERCENT, etc. to customize)"
+            )
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("CONFIRM TRADE", callback_data=f"trade_confirm:{mint}:{amount_sol}"),
+                    InlineKeyboardButton("CANCEL", callback_data=f"trade_cancel:{mint}"),
+                ]
+            ]
+            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+        except Exception as e:
+            logger.error(f"Error in /trade: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
+    async def _handle_trade_confirm(self, query, parts):
+        """Handle trade confirmation callback."""
+        # parts = [action, "mint:amount_sol"]
+        value = parts[1] if len(parts) > 1 else ""
+        sub = value.split(":")
+        mint = sub[0]
+        amount_sol = float(sub[1]) if len(sub) > 1 else 0.05
+
+        if not self.on_trade_callback:
+            await query.edit_message_text("Trade execution not configured.")
+            return
+
+        # Run analysis and create position
+        success, msg = await self.on_trade_callback(mint, amount_sol)
+        if success:
+            await query.edit_message_text(msg)
+        else:
+            await query.edit_message_text(f"Trade failed: {msg}")
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -174,6 +264,10 @@ class TradeBot:
             approve:<trade_id>
             skip:<trade_id>
             sell:<mint>
+            trade_quick:<mint>:<amount_sol>
+            trade_confirm:<mint>:<amount_sol>
+            trade_custom:<mint>
+            trade_cancel:<mint>
         """
         query = update.callback_query
         await query.answer()
@@ -189,6 +283,17 @@ class TradeBot:
             await self._handle_skip(query, value)
         elif action == "sell":
             await self._handle_sell(query, value)
+        elif action in ("trade_quick", "trade_confirm"):
+            await self._handle_trade_confirm(query, parts)
+        elif action == "trade_custom":
+            await query.edit_message_text(
+                f"Send amount in SOL as a reply, or use:\n"
+                f"/trade {value} <amount_sol>"
+            )
+        elif action == "trade_cancel":
+            await query.edit_message_text("Trade cancelled.")
+        else:
+            logger.warning(f"Unknown callback action: {action}")
     
     async def _handle_approve(self, query, trade_id: str):
         """Handle user approving a trade."""
