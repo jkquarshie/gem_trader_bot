@@ -10,6 +10,13 @@ from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 import json
 import time
+import base64
+import os
+
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solana.rpc.api import Client as SolanaClient
+from solana.rpc.types import TxOpts
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +38,21 @@ class TradeExecutor:
     USDC_MINT = "EPjFWaLb3hyccuBY4fgkQK9fu2TWrKSLBqqsCNCvuGjP"
     WRAPPED_SOL = "So11111111111111111111111111111111111111112"
     
-    def __init__(self, rpc_endpoint: str, wallet_address: str = None):
+    def __init__(self, rpc_endpoint: str, wallet_address: str = None, keypair: Keypair = None):
         """
         Initialize trade executor.
         
         Args:
             rpc_endpoint: Solana RPC endpoint
             wallet_address: User's wallet address (optional, for read-only mode)
+            keypair: Solana Keypair for signing transactions
         """
         self.rpc_endpoint = rpc_endpoint
         self.wallet_address = wallet_address
+        self.keypair = keypair
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'GemTraderBot/1.0'})
+        self.solana_client = SolanaClient(rpc_endpoint) if rpc_endpoint else None
         
         # Track positions
         self.positions = {}  # mint -> {amount, entry_price, entry_time}
@@ -254,6 +264,99 @@ class TradeExecutor:
             logger.error(f"Error testing honeypot: {e}")
             return (False, f"Test failed: {e}")
     
+    def execute_swap(self, input_mint: str, output_mint: str, amount_lamports: int,
+                     slippage_bps: int = 100) -> Optional[Dict]:
+        """
+        Execute a swap via Jupiter: get quote → sign transaction → send to RPC.
+
+        Returns tx result dict with signature, or None on failure.
+        """
+        if not self.keypair:
+            logger.warning("No keypair configured — swap not executed")
+            return None
+
+        try:
+            # Step 1: Get quote
+            quote = self.get_swap_quote(input_mint, output_mint, amount_lamports, slippage_bps)
+            if not quote:
+                return None
+
+            # Step 2: Request swap transaction from Jupiter
+            user_pk = str(self.keypair.pubkey())
+            payload = {
+                "quoteResponse": quote.get('route', {}),
+                "userPublicKey": user_pk,
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": "auto",
+            }
+            # The quote object from get_swap_quote doesn't match Jupiter's expected format
+            # We need to re-fetch the raw quote for the swap endpoint
+            raw_params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": amount_lamports,
+                "slippageBps": slippage_bps,
+            }
+            raw_resp = self.session.get(self.JUPITER_QUOTE_API, params=raw_params, timeout=10)
+            raw_resp.raise_for_status()
+            raw_quote = raw_resp.json()
+
+            if 'data' not in raw_quote or not raw_quote['data']:
+                logger.warning("No quote data for swap")
+                return None
+
+            # Take first route
+            quote_response = raw_quote['data'][0] if isinstance(raw_quote['data'], list) else raw_quote['data']
+
+            swap_payload = {
+                "quoteResponse": quote_response,
+                "userPublicKey": user_pk,
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": "auto",
+            }
+
+            swap_resp = self.session.post(self.JUPITER_SWAP_API, json=swap_payload, timeout=15)
+            swap_resp.raise_for_status()
+            swap_data = swap_resp.json()
+
+            tx_b64 = swap_data.get('swapTransaction')
+            if not tx_b64:
+                logger.warning("No swap transaction in response")
+                return None
+
+            # Step 3: Deserialize and sign
+            tx_bytes = base64.b64decode(tx_b64)
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signature = self.keypair.sign_message(tx.message.serialize())
+            signed_tx = VersionedTransaction.populate(tx.message, [signature])
+
+            # Step 4: Send to RPC
+            if not self.solana_client:
+                logger.warning("No RPC client configured")
+                return None
+
+            tx_opts = TxOpts(skip_preflight=False, max_retries=3)
+            result = self.solana_client.send_raw_transaction(
+                txn=bytes(signed_tx),
+                opts=tx_opts,
+            )
+            tx_sig = result.value if hasattr(result, 'value') else str(result)
+
+            logger.info(f"[OK] Swap executed: {tx_sig}")
+            return {
+                'signature': str(tx_sig),
+                'input_amount': amount_lamports,
+                'output_amount': quote_response.get('outAmount', 0),
+                'executed_at': datetime.now().isoformat(),
+                'user_public_key': user_pk,
+            }
+
+        except Exception as e:
+            logger.error(f"Swap execution failed: {e}")
+            return None
+
     def create_position(self, token_info: Dict, chart_result: Dict = None,
                         buy_amount_sol: float = 0.05, entry_price: float = None,
                         tp1_pct: float = 50.0, tp1_sell_pct: float = 30.0,

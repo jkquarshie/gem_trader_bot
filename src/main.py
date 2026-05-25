@@ -7,6 +7,8 @@ Runs as a continuous loop with periodic scanning.
 import logging
 import asyncio
 import os
+import json
+import base64
 import signal
 import sys
 from datetime import datetime, timezone
@@ -24,6 +26,7 @@ from chart_analyzer import ChartAnalyzer
 from trade_executor import TradeExecutor
 from telegram_bot import TradeBot
 from logger import logger
+from solders.keypair import Keypair
 
 load_dotenv()
 
@@ -65,7 +68,11 @@ class GemTraderBot:
         self.scanner = TokenScanner()
         self.rug_checker = RugChecker(self.rpc_endpoint)
         self.chart_analyzer = ChartAnalyzer()
-        self.executor = TradeExecutor(self.rpc_endpoint)
+
+        # Load wallet keypair if configured
+        self.keypair = self._load_keypair()
+        wallet_address = str(self.keypair.pubkey()) if self.keypair else None
+        self.executor = TradeExecutor(self.rpc_endpoint, wallet_address=wallet_address, keypair=self.keypair)
         self.bot = TradeBot(
             token=self.telegram_token,
             chat_id=self.telegram_chat_id,
@@ -88,33 +95,66 @@ class GemTraderBot:
             self.bot.on_stop_callback = self._on_stop_requested
             self.bot.on_trade_callback = self._on_trade_requested
     
+    def _load_keypair(self) -> Optional[Keypair]:
+        """Load Solana keypair from SOLANA_PRIVATE_KEY env var (JSON array or base64)."""
+        raw = os.getenv('SOLANA_PRIVATE_KEY') or os.getenv('SOLANA_KEYPAIR_B64')
+        if not raw:
+            logger.info("No wallet key configured — trades will be simulated")
+            return None
+
+        try:
+            # Try: JSON array from Phantom export [1,2,3,...]
+            if raw.startswith('['):
+                secret_bytes = bytes(json.loads(raw))
+            else:
+                # Try: base64 encoded
+                secret_bytes = base64.b64decode(raw)
+            kp = Keypair.from_bytes(secret_bytes)
+            logger.info(f"[OK] Wallet loaded: {kp.pubkey()}")
+            return kp
+        except Exception as e:
+            logger.error(f"Failed to load keypair: {e}")
+            return None
+
     async def _on_trade_approved(self, trade_plan: dict) -> bool:
         """Handle user approving a trade from automatic scan."""
         try:
             logger.info(f"Trade approved: {trade_plan.get('token')}")
 
             mint = trade_plan.get('token_mint')
-            if mint and self.scanner:
-                token_info = self.scanner.get_token_info(mint)
-                if not token_info:
-                    return False
-                entry_price = token_info.get('price_usd', trade_plan.get('entry_price', 0))
-                buy_amount = trade_plan.get('buy_amount_sol', 0.05)
+            if not mint or not self.scanner:
+                return False
 
-                # Create tracked position with multi-TP
-                pos = self.executor.create_position(
-                    token_info=token_info,
-                    buy_amount_sol=buy_amount,
-                    entry_price=entry_price,
-                    tp1_pct=self.tp1_pct, tp1_sell_pct=self.tp1_sell_pct,
-                    tp2_pct=self.tp2_pct, tp2_sell_pct=self.tp2_sell_pct,
-                    tp3_pct=self.tp3_pct, tp3_sell_pct=self.tp3_sell_pct,
-                    stop_loss_pct=self.stop_loss,
+            token_info = self.scanner.get_token_info(mint)
+            if not token_info:
+                return False
+
+            entry_price = token_info.get('price_usd', trade_plan.get('entry_price', 0))
+            buy_amount = trade_plan.get('buy_amount_sol', 0.05)
+
+            # Create tracked position with multi-TP
+            pos = self.executor.create_position(
+                token_info=token_info,
+                buy_amount_sol=buy_amount,
+                entry_price=entry_price,
+                tp1_pct=self.tp1_pct, tp1_sell_pct=self.tp1_sell_pct,
+                tp2_pct=self.tp2_pct, tp2_sell_pct=self.tp2_sell_pct,
+                tp3_pct=self.tp3_pct, tp3_sell_pct=self.tp3_sell_pct,
+                stop_loss_pct=self.stop_loss,
+            )
+            self.active_positions[mint] = pos
+
+            # Execute real swap if keypair is available
+            if self.keypair:
+                amount_lamports = int(buy_amount * 1e9)
+                tx_result = self.executor.execute_swap(
+                    self.executor.WRAPPED_SOL, mint, amount_lamports
                 )
-                self.active_positions[mint] = pos
-
-            # TODO: Generate and sign Jupiter swap transaction
-            # Requires wallet keypair on Railway
+                if tx_result:
+                    pos['simulated'] = False
+                    pos['tx_signature'] = tx_result['signature']
+                    trade_plan['tx_signature'] = tx_result['signature']
+                    logger.info(f"Swap executed: {tx_result['signature']}")
 
             return True
 
@@ -151,15 +191,31 @@ class GemTraderBot:
             )
             self.active_positions[mint] = pos
 
+            # Execute real swap if keypair is available
+            tx_result = None
+            if self.keypair:
+                amount_lamports = int(amount_sol * 1e9)
+                tx_result = self.executor.execute_swap(
+                    self.executor.WRAPPED_SOL, mint, amount_lamports
+                )
+                if tx_result:
+                    pos['simulated'] = False
+                    pos['tx_signature'] = tx_result['signature']
+
+            sim_tag = " [SIMULATED]" if not tx_result else ""
+            tx_line = f"\nTX: {tx_result['signature'][:16]}..." if tx_result else ""
             msg = (
-                f"[SIMULATED] Position opened:\n"
+                f"Position opened{sim_tag}:\n"
                 f"{token_info.get('symbol', mint[:8])} | {amount_sol:.4f} SOL @ ${pos['entry_price']:.8f}\n"
                 f"TP1: +{self.tp1_pct:.0f}%→sell {self.tp1_sell_pct:.0f}%  "
                 f"TP2: +{self.tp2_pct:.0f}%→sell {self.tp2_sell_pct:.0f}%  "
                 f"TP3: +{self.tp3_pct:.0f}%→sell {self.tp3_sell_pct:.0f}%\n"
-                f"SL: -{self.stop_loss:.0f}%→sell 100%\n\n"
-                f"⚠ Simulated — add SOLANA_PRIVATE_KEY to Railway for real execution."
+                f"SL: -{self.stop_loss:.0f}%→sell 100%"
+                f"{tx_line}"
             )
+
+            if not tx_result:
+                msg += "\n\n⚠ Simulated — add SOLANA_PRIVATE_KEY to Railway for real execution."
 
             logger.info(f"Position tracked: {token_info['symbol']} ({mint[:8]})")
             return (True, msg)
@@ -198,16 +254,29 @@ class GemTraderBot:
                     for action in triggered['actions']:
                         label = action['type']
                         pnl = action['pnl_pct']
-                        sim = " [SIMULATED]" if triggered['simulated'] else ""
+                        sell_tokens = action.get('sell_tokens', 0)
+
+                        # Execute real sell swap if keypair available
+                        tx_sig = None
+                        if self.keypair and not triggered['simulated'] and sell_tokens > 0:
+                            # Sell the portion back to SOL
+                            tx_result = self.executor.execute_swap(
+                                mint, self.executor.WRAPPED_SOL, sell_tokens
+                            )
+                            if tx_result:
+                                tx_sig = tx_result['signature'][:16]
+
+                        sim = " [SIMULATED]" if (not tx_sig and not triggered.get('simulated_executed')) else ""
+                        tx_line = f"\nTX: {tx_sig}..." if tx_sig else ""
                         msg = (
                             f"{triggered['symbol']}: {label} hit!{sim}\n"
                             f"P&L: {pnl:+.2f}%\n"
                         )
                         if label == 'STOP_LOSS':
-                            msg += f"Sold 100% at ${current_price:.8f}"
+                            msg += f"Sold 100% at ${current_price:.8f}{tx_line}"
                         else:
                             msg += (
-                                f"Sold {action['sell_pct']:.0f}% at ${current_price:.8f}\n"
+                                f"Sold {action['sell_pct']:.0f}% at ${current_price:.8f}{tx_line}\n"
                                 f"Remaining: {action['remaining_pct']:.0f}%"
                             )
                         if triggered['status'] == 'CLOSED':
